@@ -5,55 +5,58 @@
 #include "cuda/traits.cuh"
 #include "cuda/thrust.hpp"
 
+#include <cuda_runtime_api.h>
 #include <cusparse_v2.h>
 
-#include <algorithm>
-#include <complex>
-#include <vector>
-
-#include <thrust/device_vector.h>
 #include <thrust/copy.h>
+#include <thrust/device_vector.h>
+#include <thrust/transform.h>
+
+#include <complex>
+#include <cstdint>
+#include <limits>
+#include <mutex>
 
 namespace cpb { namespace compute { namespace gpu { namespace detail {
 
 namespace {
     template<class scalar_t>
-    struct ValueConverter {
-        using device_type = scalar_t;
+    struct DeviceValue { using type = scalar_t; };
 
-        static device_type to_device(scalar_t const& value) {
-            return value;
-        }
+    template<>
+    struct DeviceValue<std::complex<float>> { using type = cuFloatComplex; };
 
-        static scalar_t to_host(device_type const& value) {
-            return value;
-        }
+    template<>
+    struct DeviceValue<std::complex<double>> { using type = cuDoubleComplex; };
+
+    template<class scalar_t>
+    using device_value_t = typename DeviceValue<scalar_t>::type;
+
+    template<class device_t>
+    struct ScalarOps;
+
+    template<>
+    struct ScalarOps<float> {
+        static float one() { return 1.0f; }
+        static float minus_one() { return -1.0f; }
     };
 
     template<>
-    struct ValueConverter<std::complex<float>> {
-        using device_type = cuFloatComplex;
-
-        static device_type to_device(std::complex<float> const& value) {
-            return make_cuFloatComplex(value.real(), value.imag());
-        }
-
-        static std::complex<float> to_host(device_type const& value) {
-            return {cuCrealf(value), cuCimagf(value)};
-        }
+    struct ScalarOps<double> {
+        static double one() { return 1.0; }
+        static double minus_one() { return -1.0; }
     };
 
     template<>
-    struct ValueConverter<std::complex<double>> {
-        using device_type = cuDoubleComplex;
+    struct ScalarOps<cuFloatComplex> {
+        static cuFloatComplex one() { return make_cuFloatComplex(1.0f, 0.0f); }
+        static cuFloatComplex minus_one() { return make_cuFloatComplex(-1.0f, 0.0f); }
+    };
 
-        static device_type to_device(std::complex<double> const& value) {
-            return make_cuDoubleComplex(value.real(), value.imag());
-        }
-
-        static std::complex<double> to_host(device_type const& value) {
-            return {cuCreal(value), cuCimag(value)};
-        }
+    template<>
+    struct ScalarOps<cuDoubleComplex> {
+        static cuDoubleComplex one() { return make_cuDoubleComplex(1.0, 0.0); }
+        static cuDoubleComplex minus_one() { return make_cuDoubleComplex(-1.0, 0.0); }
     };
 
     template<class device_t>
@@ -108,116 +111,293 @@ namespace {
     };
 
     template<class scalar_t>
-    inline bool check_dimensions(SparseMatrixX<scalar_t> const& matrix) {
-        auto const rows = static_cast<int>(matrix.rows());
-        auto const cols = static_cast<int>(matrix.cols());
-        return rows >= 0 && cols >= 0;
-    }
-}
+    struct MatrixCache {
+        using device_t = device_value_t<scalar_t>;
 
- template<class scalar_t>
- bool kpm_spmv_cuda(idx_t start, idx_t end, SparseMatrixX<scalar_t> const& matrix,
-                    scalar_t const* x_data, scalar_t* y_data) {
-    if (!check_dimensions(matrix)) {
+        SparseMatrixX<scalar_t> const* matrix_ptr = nullptr;
+        int rows = 0;
+        int cols = 0;
+        int nnz = 0;
+
+        thr::device_vector<int> row_ptr;
+        thr::device_vector<int> col_ind;
+        thr::device_vector<device_t> values;
+
+        thr::device_vector<device_t> x_buffer;
+        thr::device_vector<device_t> y_buffer;
+        thr::device_vector<int> row_ptr_slice;
+
+        bool ensure(SparseMatrixX<scalar_t> const& matrix) {
+            auto const new_rows = static_cast<int>(matrix.rows());
+            auto const new_cols = static_cast<int>(matrix.cols());
+            auto const new_nnz = static_cast<int>(matrix.nonZeros());
+
+            if (matrix_ptr == &matrix && rows == new_rows && cols == new_cols && nnz == new_nnz) {
+                return true;
+            }
+
+            matrix_ptr = &matrix;
+            rows = new_rows;
+            cols = new_cols;
+            nnz = new_nnz;
+
+            row_ptr.resize(rows + 1);
+            col_ind.resize(nnz);
+            values.resize(nnz);
+
+            auto const row_bytes = static_cast<size_t>(rows + 1) * sizeof(int);
+            auto const col_bytes = static_cast<size_t>(nnz) * sizeof(int);
+            auto const val_bytes = static_cast<size_t>(nnz) * sizeof(device_t);
+
+            if (rows > 0) {
+                auto status = cudaMemcpy(row_ptr.data().get(), matrix.outerIndexPtr(), row_bytes,
+                                         cudaMemcpyHostToDevice);
+                if (status != cudaSuccess) {
+                    reset();
+                    return false;
+                }
+            }
+
+            if (nnz > 0) {
+                auto status = cudaMemcpy(col_ind.data().get(), matrix.innerIndexPtr(), col_bytes,
+                                         cudaMemcpyHostToDevice);
+                if (status != cudaSuccess) {
+                    reset();
+                    return false;
+                }
+
+                static_assert(sizeof(device_t) == sizeof(scalar_t), "device scalar size mismatch");
+                status = cudaMemcpy(values.data().get(), matrix.valuePtr(), val_bytes,
+                                    cudaMemcpyHostToDevice);
+                if (status != cudaSuccess) {
+                    reset();
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        void reset() {
+            matrix_ptr = nullptr;
+            rows = 0;
+            cols = 0;
+            nnz = 0;
+            row_ptr.clear();
+            col_ind.clear();
+            values.clear();
+            x_buffer.clear();
+            y_buffer.clear();
+            row_ptr_slice.clear();
+        }
+    };
+
+    template<class scalar_t>
+    MatrixCache<scalar_t>& cache_instance() {
+        static MatrixCache<scalar_t> cache;
+        return cache;
+    }
+
+    template<class scalar_t>
+    std::mutex& cache_mutex() {
+        static std::mutex mutex;
+        return mutex;
+    }
+
+    class CusparseHandle {
+    public:
+        CusparseHandle() {
+            if (cusparseCreate(&handle) == CUSPARSE_STATUS_SUCCESS) {
+                cusparseSetPointerMode(handle, CUSPARSE_POINTER_MODE_HOST);
+            } else {
+                handle = nullptr;
+            }
+        }
+
+        ~CusparseHandle() {
+            if (handle) {
+                cusparseDestroy(handle);
+            }
+        }
+
+        cusparseHandle_t get() const { return handle; }
+
+    private:
+        cusparseHandle_t handle = nullptr;
+    };
+
+    class CusparseDescriptor {
+    public:
+        CusparseDescriptor() {
+            if (cusparseCreateMatDescr(&descr) == CUSPARSE_STATUS_SUCCESS) {
+                cusparseSetMatType(descr, CUSPARSE_MATRIX_TYPE_GENERAL);
+                cusparseSetMatIndexBase(descr, CUSPARSE_INDEX_BASE_ZERO);
+            } else {
+                descr = nullptr;
+            }
+        }
+
+        ~CusparseDescriptor() {
+            if (descr) {
+                cusparseDestroyMatDescr(descr);
+            }
+        }
+
+        cusparseMatDescr_t get() const { return descr; }
+
+    private:
+        cusparseMatDescr_t descr = nullptr;
+    };
+
+    cusparseHandle_t thread_cusparse_handle() {
+        thread_local CusparseHandle handle;
+        return handle.get();
+    }
+
+    cusparseMatDescr_t thread_cusparse_descr() {
+        thread_local CusparseDescriptor descr;
+        return descr.get();
+    }
+
+    struct RowOffsetShift {
+        int offset;
+
+        __host__ __device__ int operator()(int value) const { return value - offset; }
+    };
+
+    template<class scalar_t>
+    bool ensure_matrix_cache(SparseMatrixX<scalar_t> const& matrix) {
+        auto& cache = cache_instance<scalar_t>();
+        return cache.ensure(matrix);
+    }
+
+    template<class scalar_t>
+    MatrixCache<scalar_t>& get_cache() {
+        return cache_instance<scalar_t>();
+    }
+
+    template<class scalar_t>
+    using device_t = device_value_t<scalar_t>;
+
+    template<class scalar_t>
+    device_t<scalar_t>* values_ptr(MatrixCache<scalar_t>& cache, int offset) {
+        return cache.values.data().get() + offset;
+    }
+
+    template<class scalar_t>
+    int const* col_ind_ptr(MatrixCache<scalar_t>& cache, int offset) {
+        return cache.col_ind.data().get() + offset;
+    }
+
+    template<class scalar_t>
+    device_t<scalar_t>* x_buffer_ptr(MatrixCache<scalar_t>& cache) {
+        return cache.x_buffer.data().get();
+    }
+
+    template<class scalar_t>
+    device_t<scalar_t>* y_buffer_ptr(MatrixCache<scalar_t>& cache) {
+        return cache.y_buffer.data().get();
+    }
+
+    template<class scalar_t>
+    int* row_slice_ptr(MatrixCache<scalar_t>& cache) {
+        return cache.row_ptr_slice.data().get();
+    }
+} // namespace
+
+template<class scalar_t>
+bool kpm_spmv_cuda(idx_t start, idx_t end, SparseMatrixX<scalar_t> const& matrix,
+                   scalar_t const* x_data, scalar_t* y_data) {
+    auto& mutex = cache_mutex<scalar_t>();
+    std::lock_guard<std::mutex> lock(mutex);
+
+    static_assert(sizeof(device_t<scalar_t>) == sizeof(scalar_t), "CUDA value type mismatch");
+
+    auto const total_rows = matrix.rows();
+    auto const total_cols = matrix.cols();
+    if (total_rows > std::numeric_limits<int>::max() ||
+        total_cols > std::numeric_limits<int>::max()) {
         return false;
     }
 
-    auto const total_rows = static_cast<int>(matrix.rows());
-    auto const total_cols = static_cast<int>(matrix.cols());
     if (start < 0 || end < start || end > total_rows) {
         return false;
     }
 
     auto const rows = static_cast<int>(end - start);
-    if (rows <= 0) {
+    if (rows == 0) {
         return true;
     }
 
-    auto const* row_ptr_base = matrix.outerIndexPtr();
-    auto const nnz_begin = static_cast<int>(row_ptr_base[start]);
-    auto const nnz_end = static_cast<int>(row_ptr_base[end]);
+    auto const nnz_begin = static_cast<int>(matrix.outerIndexPtr()[start]);
+    auto const nnz_end = static_cast<int>(matrix.outerIndexPtr()[end]);
     auto const nnz = nnz_end - nnz_begin;
     if (nnz < 0) {
         return false;
     }
 
-    std::vector<int> row_ptr(rows + 1);
-    for (auto i = 0; i <= rows; ++i) {
-        row_ptr[i] = static_cast<int>(row_ptr_base[start + i] - row_ptr_base[start]);
+    if (nnz == 0) {
+        for (auto row = start; row < end; ++row) {
+            y_data[row] = -y_data[row];
+        }
+        return true;
     }
 
-    std::vector<int> col_ind(nnz);
-    auto const* matrix_col = matrix.innerIndexPtr();
-    for (auto i = 0; i < nnz; ++i) {
-        col_ind[i] = static_cast<int>(matrix_col[nnz_begin + i]);
-    }
-
-    using Converter = ValueConverter<scalar_t>;
-    using device_t = typename Converter::device_type;
-
-    std::vector<device_t> values(nnz);
-    auto const* matrix_val = matrix.valuePtr();
-    std::transform(matrix_val + nnz_begin, matrix_val + nnz_begin + nnz,
-                   values.begin(), Converter::to_device);
-
-    std::vector<device_t> x_host(total_cols);
-    std::transform(x_data, x_data + total_cols, x_host.begin(), Converter::to_device);
-
-    std::vector<device_t> y_host(rows);
-    std::transform(y_data + start, y_data + end, y_host.begin(), Converter::to_device);
-
-    thr::device_vector<int> d_row_ptr(row_ptr.begin(), row_ptr.end());
-    thr::device_vector<int> d_col_ind(col_ind.begin(), col_ind.end());
-    thr::device_vector<device_t> d_values(values.begin(), values.end());
-    thr::device_vector<device_t> d_x(x_host.begin(), x_host.end());
-    thr::device_vector<device_t> d_y(y_host.begin(), y_host.end());
-
-    cusparseHandle_t handle = nullptr;
-    if (cusparseCreate(&handle) != CUSPARSE_STATUS_SUCCESS) {
+    if (!ensure_matrix_cache(matrix)) {
         return false;
     }
 
-    cusparseMatDescr_t descr = nullptr;
-    auto status = cusparseCreateMatDescr(&descr);
-    if (status != CUSPARSE_STATUS_SUCCESS) {
-        cusparseDestroy(handle);
+    auto& cache = get_cache<scalar_t>();
+    auto const cols = static_cast<int>(total_cols);
+
+    cache.x_buffer.resize(cols);
+    cache.y_buffer.resize(rows);
+    cache.row_ptr_slice.resize(rows + 1);
+
+    auto const handle = thread_cusparse_handle();
+    auto const descr = thread_cusparse_descr();
+    if (!handle || !descr) {
         return false;
     }
 
-    cusparseSetMatType(descr, CUSPARSE_MATRIX_TYPE_GENERAL);
-    cusparseSetMatIndexBase(descr, CUSPARSE_INDEX_BASE_ZERO);
+    auto const bytes_x = static_cast<size_t>(cols) * sizeof(device_t<scalar_t>);
+    auto const bytes_y = static_cast<size_t>(rows) * sizeof(device_t<scalar_t>);
+    auto const status_x = bytes_x > 0 ? cudaMemcpy(x_buffer_ptr(cache), x_data, bytes_x,
+                                                   cudaMemcpyHostToDevice)
+                                      : cudaSuccess;
+    auto const status_y = bytes_y > 0 ? cudaMemcpy(y_buffer_ptr(cache), y_data + start, bytes_y,
+                                                   cudaMemcpyHostToDevice)
+                                      : cudaSuccess;
+    if (status_x != cudaSuccess || status_y != cudaSuccess) {
+        return false;
+    }
 
-    auto alpha = Converter::to_device(scalar_t{1});
-    auto beta = Converter::to_device(scalar_t{-1});
+    thr::copy(cache.row_ptr.begin() + start, cache.row_ptr.begin() + start + rows + 1,
+              cache.row_ptr_slice.begin());
+    thrust::transform(cache.row_ptr_slice.begin(), cache.row_ptr_slice.end(),
+                      cache.row_ptr_slice.begin(), RowOffsetShift{nnz_begin});
 
-    status = CusparseCaller<device_t>::call(handle, rows, cols, nnz,
-                                            &alpha, descr,
-                                            thr::raw_pointer_cast(d_values.data()),
-                                            thr::raw_pointer_cast(d_row_ptr.data()),
-                                            thr::raw_pointer_cast(d_col_ind.data()),
-                                            thr::raw_pointer_cast(d_x.data()),
-                                            &beta,
-                                            thr::raw_pointer_cast(d_y.data()));
+    auto const alpha = ScalarOps<device_t<scalar_t>>::one();
+    auto const beta = ScalarOps<device_t<scalar_t>>::minus_one();
 
-    cusparseDestroyMatDescr(descr);
-    cusparseDestroy(handle);
+    auto const status = CusparseCaller<device_t<scalar_t>>::call(handle, rows, cols, nnz,
+        &alpha, descr, values_ptr(cache, nnz_begin), row_slice_ptr(cache),
+        col_ind_ptr(cache, nnz_begin), x_buffer_ptr(cache), &beta, y_buffer_ptr(cache));
 
     if (status != CUSPARSE_STATUS_SUCCESS) {
         return false;
     }
 
-    thr::copy(d_y.begin(), d_y.end(), y_host.begin());
-    for (auto i = 0; i < rows; ++i) {
-        y_data[start + i] = Converter::to_host(y_host[i]);
-    }
+    auto const status_out = bytes_y > 0 ? cudaMemcpy(y_data + start, y_buffer_ptr(cache), bytes_y,
+                                                     cudaMemcpyDeviceToHost)
+                                        : cudaSuccess;
+    return status_out == cudaSuccess;
+}
 
-    return true;
- }
- 
- template bool kpm_spmv_cuda<float>(idx_t, idx_t, SparseMatrixX<float> const&, float const*, float*);
- template bool kpm_spmv_cuda<double>(idx_t, idx_t, SparseMatrixX<double> const&, double const*, double*);
- template bool kpm_spmv_cuda<std::complex<float>>(idx_t, idx_t, SparseMatrixX<std::complex<float>> const&, std::complex<float> const*, std::complex<float>*);
- template bool kpm_spmv_cuda<std::complex<double>>(idx_t, idx_t, SparseMatrixX<std::complex<double>> const&, std::complex<double> const*, std::complex<double>*);
+template bool kpm_spmv_cuda<float>(idx_t, idx_t, SparseMatrixX<float> const&, float const*, float*);
+template bool kpm_spmv_cuda<double>(idx_t, idx_t, SparseMatrixX<double> const&, double const*, double*);
+template bool kpm_spmv_cuda<std::complex<float>>(idx_t, idx_t, SparseMatrixX<std::complex<float>> const&, std::complex<float> const*, std::complex<float>*);
+template bool kpm_spmv_cuda<std::complex<double>>(idx_t, idx_t, SparseMatrixX<std::complex<double>> const&, std::complex<double> const*, std::complex<double>*);
 
 }}}} // namespace cpb::compute::gpu::detail
 
