@@ -1,8 +1,8 @@
 import numpy as np
 import pytest
 
-import pybinding as pb
-from pybinding.repository import graphene
+pb = pytest.importorskip("pybinding", reason="pybinding is required for GPU regression tests")
+graphene = pytest.importorskip("pybinding.repository.graphene", reason="graphene repository module unavailable")
 
 
 @pytest.mark.parametrize("matrix_format", ["CSR", "ELL"])
