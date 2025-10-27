@@ -5,6 +5,7 @@ set(CUDA_NVCC_FLAGS "--std c++11;-Wno-deprecated-gpu-targets;${CUDA_NVCC_FLAGS}"
 cuda_add_library(pybinding_cuda
     kpm/calc_moments.hpp
     kpm/calc_moments.cu
+    kpm/spmv.cu
     thrust.hpp
     traits.cuh
 )
@@ -15,3 +16,4 @@ cuda_include_directories($<TARGET_PROPERTY:pybinding_cuda,INCLUDE_DIRECTORIES>)
 
 target_compile_definitions(pybinding_cuda PUBLIC CPB_USE_CUDA)
 target_include_directories(pybinding_cuda SYSTEM PUBLIC ${CUDA_INCLUDE_DIRS})
+target_link_libraries(pybinding_cuda PUBLIC ${CUDA_cusparse_LIBRARY})
