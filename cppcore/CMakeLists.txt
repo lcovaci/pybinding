@@ -15,8 +15,10 @@ add_library(cppcore
     include/compute/mkl/lanczos.hpp
     include/compute/mkl/wrapper.hpp
     include/compute/detail.hpp
+    include/compute/backend.hpp
     include/compute/kernel_polynomial.hpp
     include/compute/lanczos.hpp
+    include/compute/kpm_gpu.hpp
     include/detail/algorithm.hpp
     include/detail/config.hpp
     include/detail/macros.hpp
@@ -30,6 +32,7 @@ add_library(cppcore
     include/hamiltonian/HamiltonianModifiers.hpp
     include/kpm/default/collectors.hpp
     include/kpm/default/Compute.hpp
+    include/kpm/gpu/Compute.hpp
     include/kpm/Bounds.hpp
     include/kpm/calc_moments.hpp
     include/kpm/Config.hpp
@@ -74,6 +77,7 @@ add_library(cppcore
     src/hamiltonian/HamiltonianModifiers.cpp
     src/kpm/default/collectors.cpp
     src/kpm/default/Compute.cpp
+    src/kpm/gpu/Compute.cpp
     src/kpm/Bounds.cpp
     src/kpm/Core.cpp
     src/kpm/Kernel.cpp
@@ -95,6 +99,7 @@ add_library(cppcore
     src/system/Symmetry.cpp
     src/system/System.cpp
     src/utils/Chrono.cpp
+    src/compute/backend.cpp
     src/KPM.cpp
     src/Lattice.cpp
     src/Model.cpp

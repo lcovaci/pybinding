@@ -5,6 +5,8 @@
 #include "numeric/traits.hpp"
 
 #include "compute/detail.hpp"
+#include "compute/backend.hpp"
+#include "compute/kpm_gpu.hpp"
 #include "detail/macros.hpp"
 #include "support/simd.hpp"
 
@@ -15,9 +17,11 @@ namespace cpb { namespace compute {
 
  Equivalent to: y = matrix * x - y
  */
+namespace detail {
+
 template<class scalar_t> CPB_ALWAYS_INLINE
-void kpm_spmv(idx_t start, idx_t end, SparseMatrixX<scalar_t> const& matrix,
-              VectorX<scalar_t> const& x, VectorX<scalar_t>& y) {
+void kpm_spmv_cpu(idx_t start, idx_t end, SparseMatrixX<scalar_t> const& matrix,
+                  VectorX<scalar_t> const& x, VectorX<scalar_t>& y) {
     auto const data = matrix.valuePtr();
     auto const indices = matrix.innerIndexPtr();
     auto const indptr = matrix.outerIndexPtr();
@@ -32,8 +36,8 @@ void kpm_spmv(idx_t start, idx_t end, SparseMatrixX<scalar_t> const& matrix,
 }
 
 template<class scalar_t> CPB_ALWAYS_INLINE
-void kpm_spmv(idx_t start, idx_t end, SparseMatrixX<scalar_t> const& matrix,
-              MatrixX<scalar_t> const& x, MatrixX<scalar_t>& y) {
+void kpm_spmv_cpu(idx_t start, idx_t end, SparseMatrixX<scalar_t> const& matrix,
+                  MatrixX<scalar_t> const& x, MatrixX<scalar_t>& y) {
     auto const data = matrix.valuePtr();
     auto const indices = matrix.innerIndexPtr();
     auto const indptr = matrix.outerIndexPtr();
@@ -49,6 +53,60 @@ void kpm_spmv(idx_t start, idx_t end, SparseMatrixX<scalar_t> const& matrix,
     }
 }
 
+template<class scalar_t> CPB_ALWAYS_INLINE
+void kpm_spmv_diagonal_cpu(idx_t start, idx_t end, SparseMatrixX<scalar_t> const& matrix,
+                           VectorX<scalar_t> const& x, VectorX<scalar_t>& y,
+                           scalar_t& m2, scalar_t& m3) {
+    kpm_spmv_cpu(start, end, matrix, x, y);
+    auto const size = end - start;
+    m2 += x.segment(start, size).squaredNorm();
+    m3 += y.segment(start, size).dot(x.segment(start, size));
+}
+
+template<class scalar_t> CPB_ALWAYS_INLINE
+void kpm_spmv_diagonal_cpu(idx_t start, idx_t end, SparseMatrixX<scalar_t> const& matrix,
+                           MatrixX<scalar_t> const& x, MatrixX<scalar_t>& y,
+                           simd::array<scalar_t>& m2, simd::array<scalar_t>& m3) {
+    kpm_spmv_cpu(start, end, matrix, x, y);
+    auto const size = end - start;
+    auto const cols = x.cols();
+    for (auto i = 0; i < cols; ++i) {
+        m2[i] += x.col(i).segment(start, size).squaredNorm();
+        m3[i] += y.col(i).segment(start, size).dot(x.col(i).segment(start, size));
+    }
+}
+
+template<class Matrix>
+bool should_try_gpu(Matrix const&) {
+    auto const backend = get_backend();
+    if (backend == Backend::CPU) {
+        return false;
+    }
+    return backend_available(backend);
+}
+
+} // namespace detail
+
+template<class scalar_t> CPB_ALWAYS_INLINE
+void kpm_spmv(idx_t start, idx_t end, SparseMatrixX<scalar_t> const& matrix,
+              VectorX<scalar_t> const& x, VectorX<scalar_t>& y) {
+    if (detail::should_try_gpu(matrix) &&
+        gpu::kpm_spmv(get_backend(), start, end, matrix, x, y)) {
+        return;
+    }
+    detail::kpm_spmv_cpu(start, end, matrix, x, y);
+}
+
+template<class scalar_t> CPB_ALWAYS_INLINE
+void kpm_spmv(idx_t start, idx_t end, SparseMatrixX<scalar_t> const& matrix,
+              MatrixX<scalar_t> const& x, MatrixX<scalar_t>& y) {
+    if (detail::should_try_gpu(matrix) &&
+        gpu::kpm_spmv(get_backend(), start, end, matrix, x, y)) {
+        return;
+    }
+    detail::kpm_spmv_cpu(start, end, matrix, x, y);
+}
+
 /**
  KPM-specialized sparse matrix-vector multiplication (CSR, diagonal)
 
@@ -61,23 +119,22 @@ template<class scalar_t> CPB_ALWAYS_INLINE
 void kpm_spmv_diagonal(idx_t start, idx_t end, SparseMatrixX<scalar_t> const& matrix,
                        VectorX<scalar_t> const& x, VectorX<scalar_t>& y,
                        scalar_t& m2, scalar_t& m3) {
-    kpm_spmv(start, end, matrix, x, y);
-    auto const size = end - start;
-    m2 += x.segment(start, size).squaredNorm();
-    m3 += y.segment(start, size).dot(x.segment(start, size));
+    if (detail::should_try_gpu(matrix) &&
+        gpu::kpm_spmv_diagonal(get_backend(), start, end, matrix, x, y, m2, m3)) {
+        return;
+    }
+    detail::kpm_spmv_diagonal_cpu(start, end, matrix, x, y, m2, m3);
 }
 
 template<class scalar_t> CPB_ALWAYS_INLINE
 void kpm_spmv_diagonal(idx_t start, idx_t end, SparseMatrixX<scalar_t> const& matrix,
                        MatrixX<scalar_t> const& x, MatrixX<scalar_t>& y,
                        simd::array<scalar_t>& m2, simd::array<scalar_t>& m3) {
-    kpm_spmv(start, end, matrix, x, y);
-    auto const size = end - start;
-    auto const cols = x.cols();
-    for (auto i = 0; i < cols; ++i) {
-        m2[i] += x.col(i).segment(start, size).squaredNorm();
-        m3[i] += y.col(i).segment(start, size).dot(x.col(i).segment(start, size));
+    if (detail::should_try_gpu(matrix) &&
+        gpu::kpm_spmv_diagonal(get_backend(), start, end, matrix, x, y, m2, m3)) {
+        return;
     }
+    detail::kpm_spmv_diagonal_cpu(start, end, matrix, x, y, m2, m3);
 }
 
 /**

@@ -1,11 +1,15 @@
 #include "KPM.hpp"
 #include "wrappers.hpp"
 #include "thread.hpp"
+#include "kpm/gpu/Compute.hpp"
+#include "compute/backend.hpp"
+#include <utility>
 using namespace cpb;
 
 namespace {
 
-void wrap_kpm_strategy(py::module& m, char const* name) {
+template<class ComputeFactory>
+void wrap_kpm_strategy(py::module& m, char const* name, ComputeFactory&& factory) {
     auto const kpm_defaults = kpm::Config();
     m.def(
         name,
@@ -22,7 +26,7 @@ void wrap_kpm_strategy(py::module& m, char const* name) {
             config.algorithm.interleaved = interleaved;
             config.lanczos_precision = lanczos;
 
-            return KPM(model, kpm::DefaultCompute(num_threads, progress_callback), config);
+            return KPM(model, factory(num_threads, progress_callback), config);
         },
         "model"_a,
         "energy_range"_a=py::make_tuple(kpm_defaults.min_energy, kpm_defaults.max_energy),
@@ -101,7 +105,19 @@ void wrap_greens(py::module& m) {
         })
         .def_property_readonly("stats", [](KPM& kpm) { return kpm.get_core().get_stats(); });
 
-    wrap_kpm_strategy(m, "kpm");
+    wrap_kpm_strategy(m, "kpm", [](idx_t num_threads, kpm::DefaultCompute::ProgressCallback cb) {
+        return kpm::DefaultCompute(num_threads, std::move(cb));
+    });
+
+    wrap_kpm_strategy(m, "kpm_cuda", [](idx_t num_threads, kpm::DefaultCompute::ProgressCallback cb) {
+        if (!compute::backend_available(compute::Backend::CUDA)) {
+            throw std::runtime_error(
+                "The module was compiled without CUDA support."
+                " Use a different KPM implementation or recompile with CUDA."
+            );
+        }
+        return kpm::CudaCompute(num_threads, std::move(cb));
+    });
 
     py::class_<kpm::OptimizedHamiltonian>(m, "OptimizedHamiltonian")
         .def(py::init([](Hamiltonian const& h, int index) {
