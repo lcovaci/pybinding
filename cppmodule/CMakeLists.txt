@@ -1,6 +1,18 @@
 set(PYBIND11_CPP_STANDARD ${PB_CPP_STANDARD} CACHE STRING "Match core library")
 set(PYBIND11_PYTHON_VERSION 3.5 CACHE STRING "Minimum required Python version")
-add_subdirectory(deps/pybind11 EXCLUDE_FROM_ALL)
+
+find_package(pybind11 QUIET CONFIG)
+
+if(NOT pybind11_FOUND)
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/deps/pybind11/CMakeLists.txt)
+        add_subdirectory(deps/pybind11 EXCLUDE_FROM_ALL)
+    else()
+        message(FATAL_ERROR
+            "pybind11 not found. Install pybind11 with your package manager or "
+            "initialize the bundled submodule via 'git submodule update --init'."
+        )
+    endif()
+endif()
 
 pybind11_add_module(_pybinding THIN_LTO
     include/cast.hpp
